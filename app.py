@@ -145,15 +145,155 @@ def build_domain_adapter(domain_name: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB B — text adapter
+#  TAB B — text model registry
+#  To add a third model: drop a new entry here. Nothing else changes.
 # ══════════════════════════════════════════════════════════════════════════════
 
-TEXT_MODEL = "distilbert-base-uncased-finetuned-sst-2-english"
+TEXT_MODEL_CONFIG = {
+
+    "🎭 Sentiment Analysis — DistilBERT SST-2": {
+        "model_id":   "distilbert-base-uncased-finetuned-sst-2-english",
+        "domain_key": "text",
+        "description": (
+            "General-purpose **sentiment classifier** fine-tuned on movie reviews. "
+            "Predicts POSITIVE or NEGATIVE and explains which words drove the verdict."
+        ),
+        "what_to_watch": (
+            "Watch how clearly positive words (fantastic, great) push toward POSITIVE "
+            "while negative words (terrible, hated) push toward NEGATIVE. "
+            "Detoxify runs as a fully independent second audit layer beneath the prediction."
+        ),
+        "examples": [
+            "Select an example…",
+            "This market rally was absolutely fantastic — best quarter of the year!",
+            "I hated every single minute of this terrible earnings call.",
+            "The trade was okay, nothing special but not a total disaster.",
+            "You are completely useless and I hate everything about this.",
+        ],
+    },
+
+    "☣️ Toxic Content Classifier — Unitary ToxicBERT": {
+        "model_id":   "unitary/toxic-bert",
+        "domain_key": "text",
+        "description": (
+            "**Toxic content classifier** fine-tuned specifically on toxic language datasets. "
+            "Predicts TOXIC / NON_TOXIC. Runs alongside Detoxify — "
+            "two fully independent systems auditing the same input from different angles."
+        ),
+        "what_to_watch": (
+            "This is the architectural demo point: the **classifier** predicts toxicity "
+            "as a supervised task, while **Detoxify** scores it as a separate RAI audit. "
+            "When both agree, the signal is doubly validated. "
+            "When they disagree, it surfaces an edge case — exactly what a responsible AI "
+            "layer should catch and flag for human review."
+        ),
+        "examples": [
+            "Select an example…",
+            "I hope you have a wonderful day, stay safe everyone.",
+            "You are a complete idiot and should be ashamed of yourself.",
+            "The quarterly results were disappointing but we remain optimistic.",
+            "I will find you and make you regret everything you have ever done.",
+            "This policy is misguided but I respect the effort behind it.",
+        ],
+    },
+}
+
 
 @st.cache_resource
-def load_text_adapter():
-    return wrap(TEXT_MODEL)
+def load_text_adapter(model_id: str):
+    """Cached per model_id — switching models never reloads the one already in memory."""
+    return wrap(model_id)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED HELPER — renders the full XAI result for any text model
+#  Keeping this as one function means Tab B never duplicates rendering code
+#  no matter how many models are added to TEXT_MODEL_CONFIG.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_text_result(result, raw_input: str, domain_key: str):
+
+    # ── prediction ────────────────────────────────────────────────────────────
+    st.subheader("Prediction")
+    label  = result.prediction.label
+    score  = result.prediction.score
+    colour = "green" if "NON" in label or label == "POSITIVE" else "red"
+    st.markdown(f"**:{colour}[{label}]** — confidence `{score:.1%}`")
+    st.caption(f"Raw logits: {[round(l, 3) for l in result.prediction.raw_logits]}")
+
+    # ── SHAP word importance ──────────────────────────────────────────────────
+    st.subheader("Word Importance (SHAP)")
+    importance = result.word_importance
+    if importance:
+        tokens  = list(importance.keys())[:10]
+        values  = [importance[t] for t in tokens]
+        colours = ["#2ecc71" if v >= 0 else "#e74c3c" for v in values]
+        fig, ax = plt.subplots(figsize=(7, max(3, len(tokens) * 0.45)))
+        ax.barh(tokens[::-1], values[::-1], color=colours[::-1])
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlabel("SHAP value  (+ pushes toward predicted label)")
+        ax.set_title("Token Attribution Map")
+        st.pyplot(fig)
+        plt.close(fig)
+
+    # ── RAI scorecard ─────────────────────────────────────────────────────────
+    st.subheader("Responsibility Scorecard  *(Detoxify — independent audit)*")
+    r = result.responsibility
+    rai_scores = {
+        "Toxicity":        r.toxicity,
+        "Severe Toxicity": r.severe_toxicity,
+        "Obscene":         r.obscene,
+        "Insult":          r.insult,
+        "Threat":          r.threat,
+        "Identity Attack": r.identity_attack,
+    }
+    rai_df = pd.DataFrame(rai_scores.items(), columns=["Category", "Score"])
+
+    def _highlight(row):
+        return [
+            "background-color: #fde8e8"
+            if row["Score"] > RAI_FLAG_THRESHOLD else ""
+            for _ in row
+        ]
+
+    st.dataframe(
+        rai_df.style.apply(_highlight, axis=1).format({"Score": "{:.4f}"}),
+        use_container_width=True, hide_index=True,
+    )
+    flag_colour = "red" if r.bias_flagged else "green"
+    st.markdown(
+        f"**Detoxify Flag: :{flag_colour}"
+        f"[{'⚠ FLAGGED' if r.bias_flagged else '✓ CLEAN'}]**"
+    )
+
+    # ── consistency check ─────────────────────────────────────────────────────
+    st.subheader("Consistency Check")
+    c = result.consistency
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Original confidence", f"{c.original_score:.1%}")
+    col2.metric("Variant confidence",  f"{c.variant_score:.1%}",
+                delta=f"{c.delta:+.1%}")
+    col3.metric("Flagged", "⚠ Yes" if c.flagged else "✓ No",
+                delta_color="inverse")
+    with st.expander("Variant text used"):
+        st.write(c.variant_text)
+
+    # ── LLM explanation ───────────────────────────────────────────────────────
+    st.subheader("AI Explanation")
+    text_result_for_llm = {
+        "prediction":  label,
+        "confidence":  score,
+        "top_factors": list(importance.items())[:5],
+        "shap_values": importance,
+        "lime_rules":  [],
+    }
+    with st.spinner("Generating explanation…"):
+        explanation = generate_explanation(
+            text_result_for_llm,
+            domain=domain_key,
+            sample_values={"input_text": raw_input},
+        )
+    st.markdown(explanation)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UI
@@ -289,126 +429,74 @@ with tab_a:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB B  —  text / LLM
+#  TAB B  —  text / LLM with model dropdown
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_b:
-    st.header("Text Sentiment Classifier + XAI / RAI")
-    st.info(f"Model: `{TEXT_MODEL}`", icon="🤖")
+    st.header("Text / LLM Classifier + XAI / RAI")
 
-    text_adapter = load_text_adapter()
+    # ── model selector ────────────────────────────────────────────────────────
+    model_choice = st.selectbox(
+        "Select a model",
+        list(TEXT_MODEL_CONFIG.keys()),
+        key="text_model_select",
+    )
+    tcfg = TEXT_MODEL_CONFIG[model_choice]
 
-    EXAMPLES = [
-        "Select an example or type your own below…",
-        "This market rally was absolutely fantastic — best quarter of the year!",
-        "I hated every single minute of this terrible earnings call.",
-        "The trade was okay, nothing special but not a total disaster.",
-        "You are completely useless and I hate everything about this.",
-    ]
+    st.info(tcfg["description"])
+    st.caption(f"HuggingFace model: `{tcfg['model_id']}`")
 
-    chosen    = st.selectbox("Quick examples", EXAMPLES)
+    with st.expander("💡 What to watch for in this demo"):
+        st.markdown(tcfg["what_to_watch"])
+
+    with st.spinner(f"Loading `{tcfg['model_id']}`…"):
+        text_adapter = load_text_adapter(tcfg["model_id"])
+    st.caption("✅ Model loaded and cached — switching back won't reload it.")
+
+    chosen = st.selectbox("Quick examples", tcfg["examples"], key="text_examples")
     raw_input = st.text_area(
         "Input text",
-        value="" if chosen == EXAMPLES[0] else chosen,
+        value="" if chosen == tcfg["examples"][0] else chosen,
         height=100,
         placeholder="Type any sentence here…",
+        key="text_input",
     )
 
     if st.button("Run Text Analysis", key="text_run"):
         if not raw_input.strip():
             st.warning("Please enter some text first.")
         else:
-            with st.spinner("Running SHAP + Detoxify…"):
+            with st.spinner(f"Running SHAP + Detoxify on `{tcfg['model_id']}`…"):
                 result = text_adapter.predict(raw_input)
 
-            # ── prediction ────────────────────────────────────────────────────
-            st.subheader("Prediction")
-            label  = result.prediction.label
-            score  = result.prediction.score
-            colour = "green" if label == "POSITIVE" else "red"
-            st.markdown(f"**:{colour}[{label}]** — confidence `{score:.1%}`")
-            st.caption(
-                f"Raw logits: {[round(l, 3) for l in result.prediction.raw_logits]}"
+            # ── agreement callout (only for toxic classifier) ─────────────────
+            if "toxic" in tcfg["model_id"].lower():
+                classifier_toxic = "NON" not in result.prediction.label
+                detoxify_toxic   = result.responsibility.bias_flagged
+                if classifier_toxic == detoxify_toxic:
+                    agree_colour = "green"
+                    agree_text   = (
+                        "✅ **Both systems agree** — "
+                        + ("doubly validated TOXIC signal." if classifier_toxic
+                           else "both give the all-clear.")
+                    )
+                else:
+                    agree_colour = "orange"
+                    agree_text   = (
+                        f"⚠️ **Systems disagree — edge case detected.**  \n"
+                        f"Classifier: **{'TOXIC' if classifier_toxic else 'NON-TOXIC'}**  "
+                        f"· Detoxify: **{'FLAGGED' if detoxify_toxic else 'CLEAN'}**  \n"
+                        "This input warrants human review."
+                    )
+                st.markdown(f"### Classifier vs RAI Audit")
+                st.markdown(f":{agree_colour}[{agree_text}]")
+                st.divider()
+
+            # ── full XAI output (shared renderer) ─────────────────────────────
+            render_text_result(result, raw_input, tcfg["domain_key"])
+
+            st.divider()
+            st.success(
+                f"✅ **Same `wrap()`. Same output structure. Different model.**  \n"
+                f"Model: `{tcfg['model_id']}`"
             )
-
-            # ── word importance ───────────────────────────────────────────────
-            st.subheader("Word Importance (SHAP)")
-            importance = result.word_importance
-            if importance:
-                tokens  = list(importance.keys())[:10]
-                values  = [importance[t] for t in tokens]
-                colours = ["#2ecc71" if v >= 0 else "#e74c3c" for v in values]
-                fig, ax = plt.subplots(figsize=(7, max(3, len(tokens) * 0.45)))
-                ax.barh(tokens[::-1], values[::-1], color=colours[::-1])
-                ax.axvline(0, color="black", linewidth=0.8)
-                ax.set_xlabel("SHAP value  (+ → pushes toward predicted label)")
-                ax.set_title("Token Attribution Map")
-                st.pyplot(fig)
-                plt.close(fig)
-
-            # ── responsibility scorecard ──────────────────────────────────────
-            st.subheader("Responsibility Scorecard")
-            r = result.responsibility
-            scores = {
-                "Toxicity":        r.toxicity,
-                "Severe Toxicity": r.severe_toxicity,
-                "Obscene":         r.obscene,
-                "Insult":          r.insult,
-                "Threat":          r.threat,
-                "Identity Attack": r.identity_attack,
-            }
-            rai_df = pd.DataFrame(scores.items(), columns=["Category", "Score"])
-
-            def _highlight(row):
-                return [
-                    "background-color: #fde8e8"
-                    if row["Score"] > RAI_FLAG_THRESHOLD else ""
-                    for _ in row
-                ]
-
-            st.dataframe(
-                rai_df.style
-                    .apply(_highlight, axis=1)
-                    .format({"Score": "{:.4f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-            flag_colour = "red" if r.bias_flagged else "green"
-            st.markdown(
-                f"**Bias / Toxicity Flag: :{flag_colour}"
-                f"[{'⚠ FLAGGED' if r.bias_flagged else '✓ CLEAN'}]**"
-            )
-
-            # ── consistency check ─────────────────────────────────────────────
-            st.subheader("Consistency Check")
-            c = result.consistency
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Original confidence", f"{c.original_score:.1%}")
-            col2.metric("Variant confidence",  f"{c.variant_score:.1%}",
-                        delta=f"{c.delta:+.1%}")
-            col3.metric("Flagged", "⚠ Yes" if c.flagged else "✓ No",
-                        delta_color="inverse")
-            with st.expander("Variant text used"):
-                st.write(c.variant_text)
-
-            # ── LLM explanation ───────────────────────────────────────────────
-            st.subheader("AI Explanation")
-
-            # Build a result dict compatible with generate_explanation
-            # by mapping text result fields to the tabular format it expects
-            text_result_for_llm = {
-                "prediction":  label,
-                "confidence":  score,
-                "top_factors": list(importance.items())[:5],
-                "shap_values": importance,
-                "lime_rules":  [],
-            }
-
-            with st.spinner("Generating explanation…"):
-                explanation = generate_explanation(
-                    text_result_for_llm,
-                    domain="text",
-                    sample_values={"input_text": raw_input},
-                )
-
-            st.markdown(explanation)
