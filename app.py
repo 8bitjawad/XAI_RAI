@@ -14,6 +14,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 from core import wrap
 from llm_engine import generate_explanation
+from generative_adapter import GenerativeAdapter
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -296,15 +297,109 @@ def render_text_result(result, raw_input: str, domain_key: str):
     st.markdown(explanation)
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  TAB C — generative LLM adapter setup
+# ══════════════════════════════════════════════════════════════════════════════
+
+import os, requests
+from dotenv import load_dotenv
+load_dotenv()
+
+def _make_openrouter_llm_fn(system_prompt: str = "") -> callable:
+    """
+    Builds a callable that sends prompts to OpenRouter and returns the
+    text response. Plugs directly into GenerativeAdapter(llm_fn=...).
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY", "")
+    model   = os.getenv("OPENROUTER_MODEL", "openai/gpt-3.5-turbo")
+
+    def call(prompt: str) -> str:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "messages": messages, "temperature": 0.3},
+                timeout=30,
+            )
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"[LLM error: {e}]"
+    return call
+
+
+# Preset chatbot personas — each is a different system prompt + label
+# This shows the adapter works across different LLM "personalities"
+CHATBOT_PRESETS = {
+    "🏥 Medical Assistant": {
+        "label":        "Medical Assistant (GPT via OpenRouter)",
+        "system":       "You are a helpful medical information assistant. Provide clear, accurate health information and always recommend consulting a doctor for personal medical advice.",
+        "examples": [
+            "Select an example…",
+            "What are the early signs of type 2 diabetes?",
+            "Is it safe to take ibuprofen every day for back pain?",
+            "What should I eat to lower my blood pressure naturally?",
+            "How do I know if I'm having a panic attack or a heart attack?",
+        ],
+        "what_to_watch": "Medical prompts often contain demographic terms (age, gender). Watch the bias probe section to see if the LLM responds differently when those are swapped.",
+    },
+    "💼 Financial Advisor": {
+        "label":        "Financial Advisor (GPT via OpenRouter)",
+        "system":       "You are a knowledgeable financial advisor. Provide clear financial guidance and always note that this is general information, not personalised financial advice.",
+        "examples": [
+            "Select an example…",
+            "Should a young person invest in stocks or bonds right now?",
+            "What is the safest way to save for retirement with a low income?",
+            "How do I know if a loan offer is predatory?",
+            "Explain dollar-cost averaging to someone who has never invested.",
+        ],
+        "what_to_watch": "Notice how words like 'young', 'low income', or demographic terms influence the advice given. The bias probe will swap these and measure output drift.",
+    },
+    "🎓 General Assistant": {
+        "label":        "General Assistant (GPT via OpenRouter)",
+        "system":       "You are a helpful, concise assistant. Answer questions clearly and accurately.",
+        "examples": [
+            "Select an example…",
+            "Explain quantum computing in simple terms.",
+            "What are the pros and cons of electric vehicles?",
+            "How does the human immune system fight viruses?",
+            "What caused the 2008 financial crisis?",
+        ],
+        "what_to_watch": "A neutral general assistant. Use this as a baseline — compare its consistency and bias scores against the domain-specific chatbots above.",
+    },
+}
+
+
+@st.cache_resource
+def build_generative_adapter(preset_name: str) -> GenerativeAdapter:
+    """Cached per preset — switching presets doesn't rebuild the existing adapter."""
+    preset = CHATBOT_PRESETS[preset_name]
+    llm_fn = _make_openrouter_llm_fn(system_prompt=preset["system"])
+    return GenerativeAdapter(
+        llm_fn       = llm_fn,
+        model_label  = preset["label"],
+        n_consistency_samples = 3,
+        rate_limit_delay      = 0.3,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UI
 # ══════════════════════════════════════════════════════════════════════════════
 
 st.title("Universal XAI + Responsible AI Layer")
 st.write("Demo: Model Prediction with Explanation and Fairness Checks")
 
-tab_a, tab_b = st.tabs([
+tab_a, tab_b, tab_c = st.tabs([
     "📊 Path A — Model-Agnostic Tabular",
-    "💬 Path B — Text / LLM",
+    "💬 Path B — Text Classifiers",
+    "🤖 Path C — Generative LLM",
 ])
 
 
@@ -499,4 +594,230 @@ with tab_b:
             st.success(
                 f"✅ **Same `wrap()`. Same output structure. Different model.**  \n"
                 f"Model: `{tcfg['model_id']}`"
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB C  —  generative LLM explainability
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_c:
+    st.header("Generative LLM Explainability")
+    st.markdown(
+        "Explains the **free-text output** of any chatbot or LLM using "
+        "perturbation analysis, semantic consistency probing, and demographic bias testing. "
+        "No access to model weights, logits, or internals required — pure black-box."
+    )
+
+    # ── API key check ─────────────────────────────────────────────────────────
+    api_key_set = bool(os.getenv("OPENROUTER_API_KEY", ""))
+    if not api_key_set:
+        st.error(
+            "⚠️ OPENROUTER_API_KEY not found in .env. "
+            "This tab makes live LLM calls via OpenRouter. "
+            "Add your key to .env to enable it."
+        )
+        st.stop()
+
+    # ── chatbot preset selector ───────────────────────────────────────────────
+    preset_name = st.selectbox(
+        "Select a chatbot persona",
+        list(CHATBOT_PRESETS.keys()),
+        key="gen_preset",
+    )
+    preset = CHATBOT_PRESETS[preset_name]
+
+    st.info(
+        f"**System prompt:** _{preset['system']}_",
+        icon="🤖",
+    )
+    with st.expander("💡 What to watch for"):
+        st.markdown(preset["what_to_watch"])
+
+    # ── cost warning ──────────────────────────────────────────────────────────
+    # st.warning(
+    #     "⚠️ **API cost notice:** Each explanation run makes approximately "
+    #     "**15–35 LLM calls** (1 baseline + perturbation + consistency + bias probes). "
+    #     "Estimated cost: $0.01–$0.05 per run depending on your OpenRouter model. "
+    #     "Use sparingly during development.",
+    #     icon="💰",
+    # )
+
+    # ── settings expander ─────────────────────────────────────────────────────
+    with st.expander("⚙️ Explanation settings"):
+        n_consistency = st.slider(
+            "Consistency samples (paraphrase probes)",
+            min_value=2, max_value=6, value=3,
+            help="More samples = better accuracy but more API calls."
+        )
+        rate_delay = st.slider(
+            "Rate limit delay between calls (seconds)",
+            min_value=0.0, max_value=2.0, value=0.3, step=0.1,
+        )
+
+    # ── example + input ───────────────────────────────────────────────────────
+    chosen_ex = st.selectbox("Quick examples", preset["examples"], key="gen_examples")
+    gen_input = st.text_area(
+        "Your prompt",
+        value="" if chosen_ex == preset["examples"][0] else chosen_ex,
+        height=120,
+        placeholder="Type any prompt you would send to a chatbot…",
+        key="gen_input",
+    )
+
+    run_gen = st.button("Run Explanation", key="gen_run")
+
+    if run_gen:
+        if not gen_input.strip():
+            st.warning("Please enter a prompt first.")
+        else:
+            adapter = build_generative_adapter(preset_name)
+            # Apply runtime settings
+            adapter.n_consistency_samples = n_consistency
+            adapter.rate_limit_delay      = rate_delay
+
+            n_est = min(len(gen_input.split()), 30) + n_consistency + 4
+            with st.spinner(
+                f"Running ~{n_est} LLM calls for full explanation… "
+                "this takes 20–60 seconds."
+            ):
+                result = adapter.explain(gen_input)
+
+            # ── LLM response ──────────────────────────────────────────────────
+            st.subheader("LLM Response")
+            st.markdown(f"> {result.llm_response}")
+
+            # ── plain-English summary ─────────────────────────────────────────
+            st.subheader("Explanation Summary")
+            st.info(result.summary())
+
+            # ── word influence chart ──────────────────────────────────────────
+            st.subheader("Word Influence (Perturbation Analysis)")
+            st.caption(
+                "Each word was masked and the LLM was re-run. "
+                "Taller bars = removing that word changed the output more = higher influence."
+            )
+            if result.word_influences:
+                inf_words  = [w.word for w in result.word_influences]
+                inf_scores = [w.influence_score for w in result.word_influences]
+                bar_cols   = [
+                    "#e74c3c" if s > 0.3 else "#f39c12" if s > 0.15 else "#2ecc71"
+                    for s in inf_scores
+                ]
+                fig, ax = plt.subplots(figsize=(8, max(3, len(inf_words) * 0.5)))
+                ax.barh(inf_words[::-1], inf_scores[::-1], color=bar_cols[::-1])
+                ax.set_xlabel("Influence score  (how much output changed when word was masked)")
+                ax.set_title("Top Influential Words in Prompt")
+                ax.axvline(0.3, color="red",    linewidth=0.8, linestyle="--", label="High influence")
+                ax.axvline(0.15, color="orange", linewidth=0.8, linestyle="--", label="Medium influence")
+                ax.legend(fontsize=8)
+                st.pyplot(fig)
+                plt.close(fig)
+
+                with st.expander("Raw influence scores"):
+                    inf_df = pd.DataFrame([
+                        {"Word": w.word, "Position": w.position,
+                         "Influence Score": w.influence_score}
+                        for w in result.word_influences
+                    ])
+                    st.dataframe(inf_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No significant word influences detected.")
+
+            # ── consistency check ─────────────────────────────────────────────
+            st.subheader("Semantic Consistency Check")
+            st.caption(
+                f"The same prompt was paraphrased {result.consistency.paraphrase_count} times "
+                "and each variation was sent to the LLM. "
+                "Low similarity = the model gives different answers to the same question."
+            )
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Mean similarity",  f"{result.consistency.mean_similarity:.2f}")
+            cc2.metric("Min similarity",   f"{result.consistency.min_similarity:.2f}")
+            con_colour = "red" if result.consistency.flagged else "green"
+            cc3.markdown(
+                f"**Flag: :{con_colour}[{'⚠ INCONSISTENT' if result.consistency.flagged else '✓ CONSISTENT'}]**"
+            )
+            if result.consistency.sample_outputs:
+                with st.expander("Sample paraphrase responses"):
+                    for i, s in enumerate(result.consistency.sample_outputs):
+                        st.markdown(f"**Paraphrase {i+1}:** {s}")
+
+            # ── bias probe ────────────────────────────────────────────────────
+            st.subheader("Demographic Bias Probe")
+            if not result.bias_probe.tested:
+                st.info(
+                    "No demographic keywords detected in this prompt. "
+                    "Try a prompt containing words like 'he', 'she', 'young', 'old', "
+                    "or personal names to trigger bias testing."
+                )
+            else:
+                st.caption(
+                    f"Demographic terms found: `{', '.join(result.bias_probe.pairs_found)}`. "
+                    "Each was swapped to its counterpart and the output drift was measured."
+                )
+                bp1, bp2 = st.columns(2)
+                bp1.metric("Max output drift", f"{result.bias_probe.max_drift:.2f}")
+                bias_colour = "red" if result.bias_probe.flagged else "green"
+                bp2.markdown(
+                    f"**Bias Flag: :{bias_colour}[{'⚠ POTENTIAL BIAS DETECTED' if result.bias_probe.flagged else '✓ NO SIGNIFICANT BIAS'}]**"
+                )
+                if result.bias_probe.flagged_swaps:
+                    with st.expander("Flagged demographic swaps"):
+                        for swap in result.bias_probe.flagged_swaps:
+                            st.markdown(
+                                f"Swapping **{swap['original_term']}** → **{swap['swapped_term']}** "
+                                f"caused drift of `{swap['drift']}`  \n"
+                                f"Swapped prompt: _{swap['swapped_prompt']}…_"
+                            )
+
+            # ── RAI scorecard ─────────────────────────────────────────────────
+            st.subheader("Responsibility Scorecard (Detoxify)")
+            st.caption("Input prompt and generated response are scored independently.")
+
+            rai = result.rai
+            rai_data = {
+                "Category":        ["Toxicity", "Severe Toxicity", "Insult", "Threat", "Identity Attack"],
+                "Prompt Score":    [rai.prompt_toxicity, rai.prompt_severe_toxicity,
+                                    rai.prompt_insult, rai.prompt_threat, rai.prompt_identity_attack],
+                "Response Score":  [rai.response_toxicity, rai.response_severe_toxicity,
+                                    rai.response_insult, rai.response_threat, rai.response_identity_attack],
+            }
+            rai_df = pd.DataFrame(rai_data)
+
+            def _rai_highlight(row):
+                styles = []
+                for col in row.index:
+                    if col in ("Prompt Score", "Response Score") and row[col] > RAI_FLAG_THRESHOLD:
+                        styles.append("background-color: #fde8e8")
+                    else:
+                        styles.append("")
+                return styles
+
+            st.dataframe(
+                rai_df.style
+                    .apply(_rai_highlight, axis=1)
+                    .format({"Prompt Score": "{:.4f}", "Response Score": "{:.4f}"}),
+                use_container_width=True, hide_index=True,
+            )
+
+            ov_colour = "red" if rai.overall_flagged else "green"
+            p_flag  = "⚠ FLAGGED" if rai.prompt_flagged   else "✓ CLEAN"
+            r_flag  = "⚠ FLAGGED" if rai.response_flagged else "✓ CLEAN"
+            st.markdown(
+                f"Prompt: :{('red' if rai.prompt_flagged else 'green')}[{p_flag}]  "
+                f"· Response: :{('red' if rai.response_flagged else 'green')}[{r_flag}]  "
+                f"· Overall: :{ov_colour}[{'⚠ FLAGGED' if rai.overall_flagged else '✓ CLEAN'}]"
+            )
+
+            # ── full JSON audit trail ─────────────────────────────────────────
+            with st.expander("📋 Full JSON audit trail"):
+                st.code(result.to_json(), language="json")
+
+            st.divider()
+            st.success(
+                f"✅ **Black-box explanation complete.**  \n"
+                f"Model: `{result.model_label}`  ·  "
+                f"Method: `{result.explanation_method}`  ·  "
+                f"Words analysed: `{len(result.word_influences)}`"
             )
