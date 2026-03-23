@@ -399,7 +399,7 @@ st.write("Demo: Model Prediction with Explanation and Fairness Checks")
 tab_a, tab_b, tab_c = st.tabs([
     "📊 Path A — Model-Agnostic Tabular",
     "💬 Path B — Text Classifiers",
-    "🤖 Path C — Generative LLM",
+    "🤖 Path B.2 — Generative LLM",
 ])
 
 
