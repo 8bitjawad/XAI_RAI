@@ -409,7 +409,44 @@ class GenerativeAdapter:
             "has", "had", "be", "been", "being", "will", "would", "could",
             "should", "may", "might", "shall", "can", "not", "no", "so",
         }
+    def explain(self, prompt: str) -> GenerativeExplanationResult:
+        """
+        Full pipeline for one prompt:
+        1. Get baseline LLM response
+        2. Perturbation analysis → word influences
+        3. Consistency check → paraphrase probing
+        4. Bias probe → demographic keyword swaps
+        5. RAI → toxicity scoring on prompt + response
+        """
+        # Step 1: baseline response
+        logger.info("Getting baseline LLM response…")
+        baseline_response = self._call_llm(prompt)
 
+        # Step 2: word-level perturbation
+        logger.info("Running perturbation analysis…")
+        word_influences = self._perturbation_analysis(prompt, baseline_response)
+
+        # Step 3: consistency check
+        logger.info("Running consistency check…")
+        consistency = self._consistency_check(prompt, baseline_response)
+
+        # Step 4: demographic bias probe
+        logger.info("Running bias probe…")
+        bias_probe = self._bias_probe(prompt, baseline_response)
+
+        # Step 5: RAI scoring
+        logger.info("Running RAI scoring…")
+        rai = self._rai.score(prompt, baseline_response)
+
+        return GenerativeExplanationResult(
+            original_prompt    = prompt,
+            llm_response       = baseline_response,
+            word_influences    = word_influences,
+            consistency        = consistency,
+            bias_probe         = bias_probe,
+            rai                = rai,
+            model_label        = self.model_label,
+        )
     def _perturbation_analysis(
         self, prompt: str, baseline_response: str
     ) -> list[WordInfluence]:
@@ -554,20 +591,14 @@ class GenerativeAdapter:
         )
 
     def _bias_probe(
-        self, prompt: str, baseline_response: str
-    ) -> BiasProbeResult:
-        """
-        Swaps demographic keywords in the prompt and checks if the model
-        produces meaningfully different outputs. Differences above the
-        threshold indicate potential bias in the model's behaviour.
-        """
+    self, prompt: str, baseline_response: str
+) -> BiasProbeResult:
         prompt_lower  = prompt.lower()
         pairs_found   = []
         flagged_swaps = []
         max_drift     = 0.0
 
         for term_a, term_b in DEMOGRAPHIC_PAIRS:
-            # Check if either term appears in the prompt
             pattern_a = re.compile(r"\b" + re.escape(term_a) + r"\b", re.IGNORECASE)
             pattern_b = re.compile(r"\b" + re.escape(term_b) + r"\b", re.IGNORECASE)
 
@@ -579,3 +610,37 @@ class GenerativeAdapter:
 
             pairs_found.append(f"{term_a}/{term_b}")
 
+            # Test swapping term_a → term_b (or vice versa, whichever is present)
+            if has_a:
+                swapped_prompt   = pattern_a.sub(term_b, prompt)
+                original_term    = term_a
+                swapped_term     = term_b
+            else:
+                swapped_prompt   = pattern_b.sub(term_a, prompt)
+                original_term    = term_b
+                swapped_term     = term_a
+
+            swapped_response = self._call_llm(swapped_prompt)
+            if not swapped_response:
+                continue
+
+            sim   = self._sim.similarity(baseline_response, swapped_response)
+            drift = round(max(0.0, 1.0 - sim), 4)
+
+            if drift > max_drift:
+                max_drift = drift
+
+            if drift > BIAS_THRESHOLD:
+                flagged_swaps.append({
+                    "original_term": original_term,
+                    "swapped_term":  swapped_term,
+                    "drift":         drift,
+                })
+
+        return BiasProbeResult(
+            tested        = len(pairs_found) > 0,
+            pairs_found   = pairs_found,
+            max_drift     = round(max_drift, 4),
+            flagged       = max_drift > BIAS_THRESHOLD,
+            flagged_swaps = flagged_swaps,
+        )

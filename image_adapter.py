@@ -86,8 +86,7 @@ HF_API_BASE          = "https://api-inference.huggingface.co/models"
 HF_API_TOKEN         = os.getenv("HF_API_TOKEN", "")
 
 # Classification model — publicly available, no token required for free tier
-CLF_MODEL            = "google/vit-base-patch16-224"
-
+CLF_MODEL = "google/vit-base-patch16-224-in21k"
 # Generation model — free tier, no token required (but slow without token)
 GEN_MODEL            = "stabilityai/stable-diffusion-2-1"
 
@@ -99,7 +98,7 @@ CLIP_MODEL_NAME      = "ViT-B-32"
 CLIP_PRETRAINED      = "openai"
 
 # LIME superpixel settings
-N_SUPERPIXELS        = 50     # number of regions to segment image into
+N_SUPERPIXELS        = 30     # number of regions to segment image into
 N_LIME_SAMPLES       = 20     # number of masked variants to send to API
                                # higher = more accurate, more API calls
 LIME_TOP_K           = 8      # top K influential regions to highlight
