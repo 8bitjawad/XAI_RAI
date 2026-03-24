@@ -5,16 +5,20 @@ Tab A  →  Model-Agnostic Tabular Demo  (finance / healthcare / real estate)
 Tab B  →  Text / LLM  (sentiment + toxicity)
 """
 
+import io
+import base64
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from PIL import Image
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.tree import DecisionTreeClassifier
 
 from core import wrap
 from llm_engine import generate_explanation
 from generative_adapter import GenerativeAdapter
+from image_adapter import ImageClassificationAdapter, ImageGenerationAdapter
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -396,10 +400,11 @@ def build_generative_adapter(preset_name: str) -> GenerativeAdapter:
 st.title("Universal XAI + Responsible AI Layer")
 st.write("Demo: Model Prediction with Explanation and Fairness Checks")
 
-tab_a, tab_b, tab_c = st.tabs([
+tab_a, tab_b, tab_c, tab_d = st.tabs([
     "📊 Path A — Model-Agnostic Tabular",
     "💬 Path B — Text Classifiers",
-    "🤖 Path B.2 — Generative LLM",
+    "🤖 Path C — Generative LLM",
+    "🖼️ Path D — Image Models",
 ])
 
 
@@ -635,13 +640,13 @@ with tab_c:
         st.markdown(preset["what_to_watch"])
 
     # ── cost warning ──────────────────────────────────────────────────────────
-    # st.warning(
-    #     "⚠️ **API cost notice:** Each explanation run makes approximately "
-    #     "**15–35 LLM calls** (1 baseline + perturbation + consistency + bias probes). "
-    #     "Estimated cost: $0.01–$0.05 per run depending on your OpenRouter model. "
-    #     "Use sparingly during development.",
-    #     icon="💰",
-    # )
+    st.warning(
+        "⚠️ **API cost notice:** Each explanation run makes approximately "
+        "**15–35 LLM calls** (1 baseline + perturbation + consistency + bias probes). "
+        "Estimated cost: $0.01–$0.05 per run depending on your OpenRouter model. "
+        "Use sparingly during development.",
+        icon="💰",
+    )
 
     # ── settings expander ─────────────────────────────────────────────────────
     with st.expander("⚙️ Explanation settings"):
@@ -821,3 +826,318 @@ with tab_c:
                 f"Method: `{result.explanation_method}`  ·  "
                 f"Words analysed: `{len(result.word_influences)}`"
             )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB D  —  Image XAI + RAI  (Path C from build plan)
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_d:
+    st.header("Image Model XAI + RAI")
+    st.markdown(
+        "Two sub-paths: **classify** an uploaded image with region-level explanations, "
+        "or **generate** an image from a prompt with word-level attribution. "
+        "Both use the HuggingFace Inference API — no local GPU needed."
+    )
+
+    img_mode = st.radio(
+        "Select mode",
+        ["🔍 C1 — Image Classification", "🎨 C2 — Image Generation"],
+        horizontal=True,
+        key="img_mode",
+    )
+
+    st.divider()
+
+    # ── C1: IMAGE CLASSIFICATION ──────────────────────────────────────────────
+    if img_mode == "🔍 C1 — Image Classification":
+        st.subheader("Image Classification + LIME Explanation")
+        st.markdown(
+            "Upload any image. The model labels it, then LIME segments the image "
+            "into regions and identifies which areas drove the prediction."
+        )
+
+        col_info1, col_info2 = st.columns(2)
+        col_info1.info(
+            f"**Classifier:** `google/vit-base-patch16-224`  \n"
+            "Vision Transformer fine-tuned on ImageNet-21k → 1000 labels."
+        )
+        col_info2.info(
+            "**XAI method:** LIME superpixel masking  \n"
+            "Black-box substitute for Grad-CAM — no gradient access needed."
+        )
+
+        with st.expander("⚙️ API cost — how many calls does this make?"):
+            st.markdown(
+                "- **1 call** for the baseline classification  \n"
+                "- **20 calls** for the LIME masking loop (one per masked variant)  \n"
+                "- **1 call** for NSFW check  \n"
+                "- **Total: ~22 HF Inference API calls** — free tier, no token needed  \n"
+                "- CLIP alignment runs **locally**, no API call"
+            )
+
+        uploaded = st.file_uploader(
+            "Upload an image (JPG, PNG, WEBP)",
+            type=["jpg", "jpeg", "png", "webp"],
+            key="clf_upload",
+        )
+
+        # Demo images for quick testing
+        st.caption("Or use a quick demo — paste any public image URL:")
+        demo_url = st.text_input(
+            "Image URL (optional)",
+            placeholder="https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg",
+            key="clf_url",
+        )
+
+        run_clf = st.button("Run Classification + Explanation", key="clf_run")
+
+        if run_clf:
+            # Load image from upload or URL
+            pil_image = None
+            if uploaded:
+                pil_image = Image.open(uploaded).convert("RGB")
+            elif demo_url.strip():
+                try:
+                    resp = requests.get(demo_url.strip(), timeout=10)
+                    pil_image = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                except Exception as e:
+                    st.error(f"Could not load image from URL: {e}")
+
+            if pil_image is None:
+                st.warning("Please upload an image or provide a URL.")
+            else:
+                c1_left, c1_right = st.columns(2)
+                c1_left.image(pil_image, caption="Input image", use_column_width=True)
+
+                with st.spinner("Classifying + running LIME (~22 API calls, ~30s)…"):
+                    try:
+                        clf_adapter = ImageClassificationAdapter()
+                        result      = clf_adapter.explain(pil_image)
+                    except Exception as e:
+                        st.error(f"Classification failed: {e}")
+                        st.stop()
+
+                # ── prediction ────────────────────────────────────────────────
+                st.subheader("Prediction")
+                pred_col1, pred_col2 = st.columns(2)
+                pred_col1.metric("Top Label",      result.top_label)
+                pred_col2.metric("Confidence",     f"{result.top_score:.1%}")
+
+                with st.expander("All top-5 labels"):
+                    labels_df = pd.DataFrame(result.all_labels)
+                    st.dataframe(
+                        labels_df.style.format({"score": "{:.4f}"}),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                # ── LIME heatmap ──────────────────────────────────────────────
+                st.subheader("Region Explanation (LIME Heatmap)")
+                st.caption(
+                    "Green regions supported the predicted label. "
+                    "Red regions opposed it. Grey = masked during analysis."
+                )
+                heatmap_img = Image.open(
+                    io.BytesIO(base64.b64decode(result.heatmap_b64))
+                )
+                c1_right.image(heatmap_img, caption="LIME heatmap", use_column_width=True)
+
+                # Region influence table
+                with st.expander("Region influence scores"):
+                    reg_df = pd.DataFrame([
+                        {
+                            "Region ID":       r.region_id,
+                            "Influence Score": r.influence_score,
+                            "Supports Label":  "✅ Yes" if r.positive else "❌ No",
+                        }
+                        for r in result.region_influences
+                    ])
+                    st.dataframe(reg_df, use_container_width=True, hide_index=True)
+
+                # ── RAI scorecard ─────────────────────────────────────────────
+                st.subheader("Responsibility Scorecard")
+                rai = result.rai
+
+                r1, r2, r3 = st.columns(3)
+                r1.metric("CLIP Alignment", f"{rai.clip_alignment:.2f}",
+                          help="How well the label semantically matches the image (CLIP cosine sim). "
+                               "Low score may indicate a wrong or low-confidence label.")
+                r2.metric("NSFW Score",     f"{rai.nsfw_score:.4f}")
+
+                ov_colour = "red" if rai.overall_flagged else "green"
+                r3.markdown(
+                    f"**RAI Flag: :{ov_colour}"
+                    f"[{'⚠ FLAGGED' if rai.overall_flagged else '✓ CLEAN'}]**"
+                )
+
+                if rai.alignment_flagged:
+                    st.warning(
+                        f"⚠️ Low CLIP alignment ({rai.clip_alignment:.2f}). "
+                        "The predicted label may not accurately describe the image content."
+                    )
+                if rai.nsfw_flagged:
+                    st.error(f"⚠️ NSFW content detected (score: {rai.nsfw_score:.4f}).")
+
+                st.divider()
+                st.success(
+                    f"✅ **Image XAI complete.**  \n"
+                    f"Model: `{result.model_id}`  ·  Method: `{result.method}`"
+                )
+
+    # ── C2: IMAGE GENERATION ──────────────────────────────────────────────────
+    else:
+        st.subheader("Image Generation + Prompt Attribution")
+        st.markdown(
+            "Type a prompt. The model generates an image, then each word is masked "
+            "and the image is regenerated to measure visual influence."
+        )
+
+        col_info3, col_info4 = st.columns(2)
+        col_info3.info(
+            f"**Generator:** `stabilityai/stable-diffusion-2-1`  \n"
+            "Stable Diffusion via HuggingFace Inference API."
+        )
+        col_info4.info(
+            "**XAI method:** Prompt token perturbation + CLIP similarity  \n"
+            "Masks each word → regenerates → measures visual drift."
+        )
+
+        with st.expander("⚙️ API cost — how many calls does this make?"):
+            st.markdown(
+                "- **1 call** for the baseline generation  \n"
+                "- **1 call per content word** (up to 12) for perturbation  \n"
+                "- **1 call** for NSFW check  \n"
+                "- **Total: ~10–14 HF Inference API calls**  \n"
+                "- Each generation call takes ~10–20s — full run takes 2–4 minutes  \n"
+                "- CLIP similarity runs **locally**, no API call  \n"
+                "- ⚠️ SD 2.1 is a large model — HF free tier may queue your request"
+            )
+
+        GENERATION_EXAMPLES = [
+            "Select an example…",
+            "a red fox sitting in a snowy forest at sunset",
+            "a futuristic city skyline at night with neon lights",
+            "an elderly woman reading a book in a cosy library",
+            "a young man running on a beach at sunrise",
+            "a bowl of ramen with soft-boiled egg and nori",
+        ]
+
+        gen_chosen = st.selectbox("Quick examples", GENERATION_EXAMPLES, key="gen_img_ex")
+        gen_prompt = st.text_input(
+            "Your prompt",
+            value="" if gen_chosen == GENERATION_EXAMPLES[0] else gen_chosen,
+            placeholder="Describe the image you want to generate…",
+            key="gen_img_prompt",
+        )
+
+        st.warning(
+            "⚠️ Generation is slow on the free HF tier (~10–20s per image). "
+            "A full explanation run takes 2–4 minutes. "
+            "Add HF_API_TOKEN to .env for faster inference.",
+            icon="⏳",
+        )
+
+        run_gen_img = st.button("Generate + Explain", key="gen_img_run")
+
+        if run_gen_img:
+            if not gen_prompt.strip():
+                st.warning("Please enter a prompt first.")
+            else:
+                word_count = len([
+                    w for w in gen_prompt.split()
+                    if re.sub(r"[^\w]", "", w.lower()) not in {
+                        "a","an","the","of","in","on","at","to","and","or",
+                        "is","are","with","by","for","from","as","its","it",
+                        "this","that","be","was","were"
+                    }
+                ])
+                n_calls = min(word_count, 12) + 2
+                with st.spinner(
+                    f"Generating baseline + {min(word_count, 12)} perturbations "
+                    f"(~{n_calls} API calls, ~{n_calls * 15}s)…"
+                ):
+                    try:
+                        gen_adapter = ImageGenerationAdapter()
+                        result      = gen_adapter.explain(gen_prompt.strip())
+                    except Exception as e:
+                        st.error(f"Generation failed: {e}")
+                        st.stop()
+
+                # ── generated image ───────────────────────────────────────────
+                st.subheader("Generated Image")
+                gen_img = Image.open(
+                    io.BytesIO(base64.b64decode(result.generated_image_b64))
+                )
+                st.image(gen_img, caption=f'"{result.prompt}"', use_column_width=False,
+                         width=400)
+
+                # ── word influence ────────────────────────────────────────────
+                st.subheader("Prompt Word Attribution")
+                st.caption(
+                    "Each bar shows how much the generated image changed "
+                    "when that word was removed from the prompt. "
+                    "Taller bar = word had more visual influence."
+                )
+
+                if result.word_influences:
+                    inf_words  = [w.word for w in result.word_influences]
+                    inf_scores = [w.influence_score for w in result.word_influences]
+                    bar_cols   = [
+                        "#e74c3c" if s > 0.25 else
+                        "#f39c12" if s > 0.10 else
+                        "#2ecc71"
+                        for s in inf_scores
+                    ]
+
+                    fig, ax = plt.subplots(figsize=(8, max(3, len(inf_words) * 0.5)))
+                    ax.barh(inf_words[::-1], inf_scores[::-1], color=bar_cols[::-1])
+                    ax.set_xlabel("Visual drift (CLIP similarity drop when word masked)")
+                    ax.set_title("Prompt Word Attribution — Image Generation")
+                    ax.axvline(0.25, color="red",    linewidth=0.8,
+                               linestyle="--", label="High influence (>0.25)")
+                    ax.axvline(0.10, color="orange", linewidth=0.8,
+                               linestyle="--", label="Medium influence (>0.10)")
+                    ax.legend(fontsize=8)
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                    st.markdown(
+                        f"**Most visually influential words:** "
+                        f"{', '.join(f'`{w}`' for w in result.top_words)}"
+                    )
+
+                # ── RAI scorecard ─────────────────────────────────────────────
+                st.subheader("Responsibility Scorecard")
+                rai = result.rai
+
+                rg1, rg2, rg3 = st.columns(3)
+                rg1.metric(
+                    "CLIP Alignment", f"{rai.clip_alignment:.2f}",
+                    help="How well the generated image matches the original prompt intent. "
+                         "Low score means the model didn't faithfully follow the prompt."
+                )
+                rg2.metric("NSFW Score", f"{rai.nsfw_score:.4f}")
+                ov_colour = "red" if rai.overall_flagged else "green"
+                rg3.markdown(
+                    f"**RAI Flag: :{ov_colour}"
+                    f"[{'⚠ FLAGGED' if rai.overall_flagged else '✓ CLEAN'}]**"
+                )
+
+                if rai.alignment_flagged:
+                    st.warning(
+                        f"⚠️ Low prompt alignment ({rai.clip_alignment:.2f}). "
+                        "The generated image may not match the prompt intent."
+                    )
+                if rai.nsfw_flagged:
+                    st.error(f"⚠️ NSFW content detected in generated image "
+                             f"(score: {rai.nsfw_score:.4f}).")
+
+                with st.expander("📋 Full JSON audit trail"):
+                    st.code(result.to_json(), language="json")
+
+                st.divider()
+                st.success(
+                    f"✅ **Image generation XAI complete.**  \n"
+                    f"Model: `{result.model_id}`  ·  Method: `{result.method}`  \n"
+                    f"Top influential words: `{result.top_words}`"
+                )
