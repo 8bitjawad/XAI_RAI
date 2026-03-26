@@ -18,7 +18,8 @@ from dotenv import load_dotenv
 from core import wrap
 from llm_engine import generate_explanation
 from generative_adapter import GenerativeAdapter
-from image_adapter import ImageClassificationAdapter, ImageGenerationAdapter
+from image_classifier_adapter import (ImageClassifierAdapter,
+                                       make_hf_pipeline_predict_fn)
 from config import (
     RAI_FLAG_THRESHOLD, DOMAIN_CONFIG, TEXT_MODEL_CONFIG,
     CHATBOT_PRESETS, IMAGE_DEMO_URLS, GENERATION_EXAMPLES,
@@ -85,7 +86,7 @@ tab_a, tab_b, tab_c, tab_d = st.tabs([
     "📊 Path A — Tabular",
     "💬 Path B — Text",
     "🤖 Path C — Generative LLM",
-    "🖼️ Path D — Image",
+    "🖼️ Path D — Image Classifier",
 ])
 
 
@@ -231,7 +232,7 @@ with tab_c:
     with st.expander("💡 What to watch"):
         st.markdown(preset["what_to_watch"])
 
-    st.warning("~11–16 LLM calls per run", icon="💰")
+    st.warning("~11–16 LLM calls per run · est. cost < $0.01 on free model", icon="💰")
 
     chosen_ex = st.selectbox("Examples", preset["examples"], key="c_examples")
     gen_input = st.text_area("Prompt",
@@ -304,131 +305,137 @@ with tab_c:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB D  —  Image models
+#  TAB D  —  Image Classifier XAI + RAI
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ONLY showing modified TAB D section — rest of your file remains unchanged
+
+from skimage.segmentation import mark_boundaries
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB D  —  Image Classifier XAI + RAI (UPDATED)
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  TAB D  —  Image Classifier XAI + RAI
+#  Drop-in replacement for the tab_d block in app.py
+# ══════════════════════════════════════════════════════════════════════════════
+
+from skimage.segmentation import mark_boundaries
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 with tab_d:
-    st.header("Image Model XAI + RAI")
+    st.header("Image Classification XAI + RAI")
 
-    mode = st.radio("Mode", ["🔍 C1 — Classification", "🎨 C2 — Generation"],
-                    horizontal=True, key="d_mode")
-    st.divider()
+    MODEL_OPTIONS = {
+        "microsoft/resnet-50":          "microsoft/resnet-50",
+        "google/efficientnet-b7":        "google/efficientnet-b7",
+        "microsoft/resnet-18 (fast)":    "microsoft/resnet-18",
+    }
 
-    # ── C1: Classification ────────────────────────────────────────────────────
-    if mode == "🔍 C1 — Classification":
-        st.subheader("Image Classification + LIME")
-        st.info("**Model:** `google/vit-base-patch16-224`  ·  **XAI:** LIME superpixel masking (black-box Grad-CAM substitute)")
+    model_choice   = st.selectbox("Model", list(MODEL_OPTIONS.keys()), key="d_model")
+    selected_model = MODEL_OPTIONS[model_choice]
 
-        with st.expander("⚙️ API calls: ~10 (8 LIME + 1 classify + 1 NSFW)"):
-            st.markdown(
-                "- Reduced from 22 → **10 calls** (8 LIME samples — fast, demo-accurate)\n"
-                "- CLIP alignment runs **locally** — no API call\n"
-                "- Free HF Inference API — no GPU needed, no token required"
+    method = st.selectbox(
+        "Explanation method",
+        ["both", "occlusion", "lime"],
+        index=0,
+        key="d_method",
+        help=(
+            "occlusion = fast (~2-3 s, one batched call). "
+            "lime = detailed superpixel map (~20-30 s). "
+            "both = show both."
+        ),
+    )
+
+    DEMO_URLS = {
+        "Cat":         "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/320px-Cat03.jpg",
+        "Dog":         "https://upload.wikimedia.org/wikipedia/commons/thumb/4/43/Cute_dog.jpg/320px-Cute_dog.jpg",
+        "Sports car":  "https://upload.wikimedia.org/wikipedia/commons/thumb/1/1b/2012_Aston_Martin_Rapide_%28cropped%29.JPG/320px-2012_Aston_Martin_Rapide_%28cropped%29.JPG",
+    }
+
+    demo_choice   = st.selectbox("Demo image", ["Upload"] + list(DEMO_URLS.keys()), key="d_demo")
+    uploaded_file = st.file_uploader("Upload image", type=["jpg", "png", "jpeg", "webp"], key="d_upload")
+
+    if st.button("Run Explanation", key="d_run"):
+        # ── Load image ───────────────────────────────────────────────────────
+        pil_image = None
+        if uploaded_file:
+            pil_image = Image.open(uploaded_file).convert("RGB")
+        elif demo_choice != "Upload":
+            try:
+                pil_image = Image.open(
+                    io.BytesIO(requests.get(DEMO_URLS[demo_choice], timeout=10).content)
+                ).convert("RGB")
+            except Exception as e:
+                st.error(f"Could not load demo image: {e}")
+
+        if pil_image is None:
+            st.warning("Please upload an image or select a demo.")
+            st.stop()
+
+        st.image(pil_image, caption="Input image", width=300)
+
+        # ── Build adapter ────────────────────────────────────────────────────
+        with st.spinner(f"Loading {selected_model}…"):
+            predict_fn, class_names = make_hf_pipeline_predict_fn(selected_model)
+
+        adapter = ImageClassifierAdapter(predict_fn=predict_fn, method=method)
+
+        # ── Run explanation ──────────────────────────────────────────────────
+        spinner_msg = {
+            "occlusion": "Running occlusion (batched, ~3 s)…",
+            "lime":      "Running LIME (~20–30 s)…",
+            "both":      "Running occlusion + LIME (~25–35 s)…",
+        }[method]
+
+        with st.spinner(spinner_msg):
+            result = adapter.explain(pil_image)
+
+        # ── Occlusion output ─────────────────────────────────────────────────
+        if "occlusion_fig" in result:
+            st.subheader("⚡ Fast Explanation — Occlusion Sensitivity")
+            st.pyplot(result["occlusion_fig"])
+            st.caption(
+                "Each region is systematically occluded. "
+                "Bright areas caused the largest drop in confidence — "
+                "the model relied on them most."
             )
 
-        demo_url = st.selectbox("Demo image URL", IMAGE_DEMO_URLS, key="d_url")
-        uploaded = st.file_uploader("Or upload an image", type=["jpg","jpeg","png","webp"], key="d_upload")
+        # ── LIME output ──────────────────────────────────────────────────────
+        if "lime" in result:
+            st.subheader("🔍 Detailed Explanation — LIME Superpixels")
 
-        if st.button("Run Classification + Explanation", key="d_clf_run"):
-            pil_image = None
-            if uploaded:
-                pil_image = Image.open(uploaded).convert("RGB")
-            elif demo_url != IMAGE_DEMO_URLS[0]:
-                try:
-                    pil_image = Image.open(
-                        io.BytesIO(requests.get(demo_url, timeout=10).content)
-                    ).convert("RGB")
-                except Exception as e:
-                    st.error(f"Could not load image: {e}")
+            lime_exp = result["lime"]
+            top_idx  = result["top_idx"]   # ← use the real baseline top_idx
 
-            if pil_image is None:
-                st.warning("Select a demo URL or upload an image.")
-            else:
-                left, right = st.columns(2)
-                left.image(pil_image, caption="Input", use_column_width=True)
+            # Safely fetch explanation — fall back to whatever LIME ranked first
+            # if top_idx isn't in LIME's results (shouldn't happen with top_labels=5)
+            label_to_explain = top_idx if top_idx in lime_exp.local_exp else lime_exp.top_labels[0]
 
-                with st.spinner("Classifying + LIME masking (~10 API calls, ~20s)…"):
-                    try:
-                        result = ImageClassificationAdapter().explain(pil_image)
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
-                        st.stop()
-
-                # Prediction
-                st.subheader("Prediction")
-                p1, p2 = st.columns(2)
-                p1.metric("Label",      result.top_label)
-                p2.metric("Confidence", f"{result.top_score:.1%}")
-                with st.expander("All top-5 labels"):
-                    st.dataframe(pd.DataFrame(result.all_labels)
-                                   .style.format({"score":"{:.4f}"}),
-                                 use_container_width=True, hide_index=True)
-
-                # Heatmap
-                st.subheader("LIME Heatmap")
-                st.caption("Green = supports prediction · Red = opposes")
-                heatmap = Image.open(io.BytesIO(base64.b64decode(result.heatmap_b64)))
-                right.image(heatmap, caption="LIME heatmap", use_column_width=True)
-
-                # RAI
-                st.subheader("Responsibility Scorecard")
-                render_image_rai(result.rai)
-                st.success(f"✅ `{result.model_id}`  ·  `{result.method}`")
-
-    # ── C2: Generation ────────────────────────────────────────────────────────
-    else:
-        st.subheader("Image Generation + Prompt Attribution")
-        st.info("**Model:** `stabilityai/stable-diffusion-2-1`  ·  **XAI:** Prompt perturbation + CLIP similarity")
-
-        with st.expander("⚙️ API calls: ~10–14 · ~2–4 min total"):
-            st.markdown(
-                "- 1 baseline generation + 1 per content word (max 12) + 1 NSFW\n"
-                "- Each generation call ~10–20s on free HF tier\n"
-                "- Add `HF_API_TOKEN` to `.env` for faster inference\n"
-                "- CLIP similarity runs **locally** — no API call"
+            temp, mask = lime_exp.get_image_and_mask(
+                label_to_explain,
+                positive_only=False,
+                num_features=8,
+                hide_rest=False,
             )
 
-        gen_ex = st.selectbox("Examples", GENERATION_EXAMPLES, key="d_gen_ex")
-        gen_prompt = st.text_input("Prompt",
-                                    value="" if gen_ex == GENERATION_EXAMPLES[0] else gen_ex,
-                                    placeholder="Describe the image…", key="d_gen_prompt")
-        st.warning("Generation is slow on free HF tier (~10–20s per image).", icon="⏳")
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            axes[0].imshow(np.array(pil_image.resize((224, 224))))
+            axes[0].set_title("Original")
+            axes[0].axis("off")
+            axes[1].imshow(mark_boundaries(temp / 255.0, mask))
+            axes[1].set_title("LIME — green supports, red opposes")
+            axes[1].axis("off")
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
 
-        if st.button("Generate + Explain", key="d_gen_run"):
-            if not gen_prompt.strip():
-                st.warning("Enter a prompt first.")
-            else:
-                with st.spinner("Generating + perturbing prompt words…"):
-                    try:
-                        result = ImageGenerationAdapter().explain(gen_prompt.strip())
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
-                        st.stop()
+            # Show top prediction label + score from LIME's own probs
+            top_score = float(lime_exp.local_pred[0]) if hasattr(lime_exp, "local_pred") else None
+            label_name = class_names[label_to_explain] if label_to_explain < len(class_names) else f"class_{label_to_explain}"
+            conf_str   = f" ({top_score:.1%} local confidence)" if top_score is not None else ""
+            st.caption(f"Explaining prediction: **{label_name}**{conf_str}")
 
-                # Generated image
-                st.subheader("Generated Image")
-                gen_img = Image.open(io.BytesIO(base64.b64decode(result.generated_image_b64)))
-                st.image(gen_img, width=400, caption=f'"{result.prompt}"')
-
-                # Word attribution chart
-                st.subheader("Prompt Word Attribution")
-                if result.word_influences:
-                    words  = [w.word for w in result.word_influences]
-                    scores = [w.influence_score for w in result.word_influences]
-                    render_bar_chart(
-                        words, scores,
-                        xlabel="Visual drift (CLIP similarity drop when word masked)",
-                        title="Prompt Word Attribution",
-                        thresholds=[(0.25, "red", ">0.25 high"),
-                                    (0.10, "orange", ">0.10 medium")],
-                    )
-                    st.markdown(f"**Most influential:** {', '.join(f'`{w}`' for w in result.top_words)}")
-
-                # RAI
-                st.subheader("Responsibility Scorecard")
-                render_image_rai(result.rai)
-
-                with st.expander("JSON audit trail"):
-                    st.code(result.to_json(), language="json")
-
-                st.success(f"✅ `{result.model_id}`  ·  top words: `{result.top_words}`")
+        st.success("Done ✅")

@@ -27,6 +27,11 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
 CONSISTENCY_THRESHOLD = 0.20   # flag if confidence swings > 20 %
 RAI_FLAG_THRESHOLD    = 0.10   # flag toxicity if any score   > 10 %
 MAX_SHAP_TOKENS       = 512
@@ -37,6 +42,11 @@ SYNONYM_SWAP = {
     "love": "adore",     "hate": "detest",     "movie": "film",
     "film": "movie",     "fast": "quick",       "quick": "fast",
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PATH A  ─  TABULAR  (your existing code, unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
 
 import shap
 from lime.lime_tabular import LimeTabularExplainer
@@ -162,7 +172,11 @@ class RAIWrapper:
         }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
 #  PATH B  ─  TEXT / LLM
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── B.1  Data contracts ───────────────────────────────────────────────────────
 
 @dataclass
 class Prediction:
@@ -230,7 +244,7 @@ class RAIScorer:
         )
 
 
-# ── TextAdapter 
+# ── B.3  TextAdapter ──────────────────────────────────────────────────────────
 
 class TextAdapter:
     """
@@ -275,7 +289,7 @@ class TextAdapter:
             model=self.model,
             tokenizer=self.tokenizer,
             device=0 if self.device == "cuda" else -1,
-            return_all_scores=True,
+            top_k=None,         # replaces deprecated return_all_scores=True
         )
 
         # SHAP Text explainer — partition strategy for NLP
@@ -429,7 +443,7 @@ def wrap(model: Any, X_train=None, sensitive_column=None, **kwargs) -> Any:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SMOKE TEST  —  python core.py
+#  SMOKE TEST  —  python xai_layer.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
